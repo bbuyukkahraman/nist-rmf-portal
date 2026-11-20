@@ -40,10 +40,48 @@ export default function SystemDetail() {
     try { await api(`/api/controls/${cid}`, { method: 'PATCH', body: JSON.stringify({ status }) }); loadAll(); }
     catch (e: any) { setErr(e.message); }
   }
+  async function uploadEvidence(cid: string) {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      const form = new FormData();
+      form.append('file', file);
+      try {
+        const t = localStorage.getItem('token') || '';
+        const res = await fetch('/api/evidence/upload', { method: 'POST', headers: { Authorization: `Bearer ${t}` }, body: form });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data?.message || 'upload failed');
+        await api(`/api/controls/${cid}`, { method: 'PATCH', body: JSON.stringify({ evidenceKey: data.key }) });
+        loadAll();
+      } catch (e: any) { setErr(e.message); }
+    };
+    input.click();
+  }
   async function addAssessment() {
     const summary = prompt('Assessment summary:'); if (!summary) return;
-    try { await api(`/api/systems/${id}/assessments`, { method: 'POST', body: JSON.stringify({ summary, findings: [] }) }); loadAll(); }
-    catch (e: any) { setErr(e.message); }
+    const autoPoam = confirm('Auto-create POA&M items for major/minor findings?');
+    const findings: any[] = [];
+    let more = true;
+    while (more) {
+      const ctrl = prompt('Finding control ID (e.g. AC-2) or cancel:'); if (!ctrl) { more = false; break; }
+      const rating = prompt('Rating (satisfied/minor/major):') || 'satisfied';
+      const note = prompt('Note:') || '';
+      findings.push({ controlId: ctrl, rating, note });
+      more = confirm('Add another finding?');
+    }
+    try {
+      const a = await api(`/api/systems/${id}/assessments`, { method: 'POST', body: JSON.stringify({ summary, findings }) });
+      if (autoPoam) {
+        for (const f of findings) {
+          if (f.rating === 'major' || f.rating === 'minor') {
+            await api('/api/poam', { method: 'POST', body: JSON.stringify({ systemId: id, controlId: f.controlId, title: `Remediate finding: ${f.controlId}`, description: f.note, owner: 'ISSO', dueDate: new Date(Date.now() + 30*86400000).toISOString().slice(0,10) }) });
+          }
+        }
+      }
+      loadAll();
+    } catch (e: any) { setErr(e.message); }
   }
   async function addPoam() {
     const title = prompt('POA&M title:'); if (!title) return;
@@ -97,7 +135,7 @@ export default function SystemDetail() {
         <div className="card">
           {controls.length === 0 ? <div className="empty">No controls. Select baseline first.</div> : (
             <table>
-              <thead><tr><th>Control</th><th>Family</th><th>Title</th><th>Status</th><th>Action</th></tr></thead>
+              <thead><tr><th>Control</th><th>Family</th><th>Title</th><th>Status</th><th>Evidence</th><th>Action</th></tr></thead>
               <tbody>
                 {controls.map(c => (
                   <tr key={c.id}>
@@ -105,6 +143,10 @@ export default function SystemDetail() {
                     <td>{c.family}</td>
                     <td>{c.title}</td>
                     <td><span className="badge">{c.status}</span></td>
+                    <td>
+                      {c.evidence_key ? <a href={`/api/evidence/${c.evidence_key}`} target="_blank" rel="noreferrer">view</a> : <span style={{ color: '#64748b', fontSize: '.8rem' }}>none</span>}
+                      <button className="btn secondary" style={{ marginLeft: '.25rem', padding: '.15rem .4rem', fontSize: '.75rem' }} onClick={() => uploadEvidence(c.id)}>upload</button>
+                    </td>
                     <td>
                       <select value={c.status} onChange={e => updateControl(c.id, e.target.value)}>
                         <option value="not_assessed">not_assessed</option>

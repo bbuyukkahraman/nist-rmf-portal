@@ -1,4 +1,6 @@
 import { Hono } from 'hono';
+import { baselineFor, overallImpact } from './baseline';
+import { generateSecret, verifyTotp, otpauthUri } from './totp';
 import { cors } from 'hono/cors';
 import { jwt, sign, verify } from 'hono/jwt';
 import type { D1Database, R2Bucket } from '@cloudflare/workers-types';
@@ -8,6 +10,10 @@ type Bindings = {
   EVIDENCE: R2Bucket;
   JWT_SECRET: string;
   ENVIRONMENT: string;
+  OIDC_ISSUER?: string;
+  OIDC_CLIENT_ID?: string;
+  OIDC_CLIENT_SECRET?: string;
+  OIDC_REDIRECT_URI?: string;
   ASSETS: Fetcher;
 };
 
@@ -105,6 +111,11 @@ app.post('/api/auth/login', async (c) => {
   if (!user) return err(c, 'unauthorized', 'invalid credentials', 401);
   const hash = await hashPassword(password, user.salt);
   if (hash !== user.password_hash) return err(c, 'unauthorized', 'invalid credentials', 401);
+  if (user.mfa_enabled) {
+    // issue short-lived mfa challenge token
+    const mfaToken = await sign({ sub: user.id, email: user.email, role: user.role, tenantId: user.tenant_id, mfa: true, exp: Math.floor(Date.now()/1000)+300 }, c.env.JWT_SECRET, 'HS256');
+    return c.json({ mfaRequired: true, mfaToken });
+  }
   const token = await sign({ sub: user.id, email: user.email, role: user.role, tenantId: user.tenant_id }, c.env.JWT_SECRET, 'HS256');
   return c.json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role, tenantId: user.tenant_id } });
 });
@@ -214,14 +225,19 @@ app.post('/api/systems/:id/baseline', async (c) => {
   if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
   const existing = await c.env.DB.prepare('SELECT COUNT(*) as n FROM controls WHERE system_id=?').bind(id).first<{n:number}>();
   if ((existing?.n ?? 0) > 0) return err(c, 'conflict', 'baseline already selected', 409);
+  const impact = overallImpact(row.impact_c, row.impact_i, row.impact_a);
+  const controls = baselineFor(impact);
   const ts = now();
-  const stmts = BASELINE_CONTROLS.map(ctrl =>
+  const stmts = controls.map(ctrl =>
     c.env.DB.prepare('INSERT INTO controls (id,system_id,tenant_id,control_id,family,title,status,updated_at) VALUES (?,?,?,?,?,?,?,?)')
       .bind(uid(), id, row.tenant_id, ctrl.id, ctrl.family, ctrl.title, 'not_assessed', ts)
   );
-  await c.env.DB.batch(stmts);
+  // D1 batch limit ~100; chunk
+  for (let k = 0; k < stmts.length; k += 50) {
+    await c.env.DB.batch(stmts.slice(k, k + 50));
+  }
   await audit(c.env, row.tenant_id, u.email, 'system.baseline', 'system', id);
-  return c.json({ systemId: id, controlsCreated: BASELINE_CONTROLS.length }, 201);
+  return c.json({ systemId: id, impact, controlsCreated: controls.length }, 201);
 });
 
 // controls
@@ -515,6 +531,107 @@ app.delete('/api/users/:id', async (c) => {
   await c.env.DB.prepare('DELETE FROM users WHERE id=?').bind(id).run();
   await audit(c.env, row.tenant_id, u.email, 'user.delete', 'user', id);
   return c.json({ id, deleted: true });
+});
+
+// ---------- MFA (TOTP) ----------
+app.post('/api/auth/mfa-login', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const { mfaToken, code } = body;
+  if (!mfaToken || !code) return err(c, 'validation', 'mfaToken and code required');
+  let payload: any;
+  try { payload = await verify(mfaToken, c.env.JWT_SECRET, 'HS256'); } catch { return err(c, 'unauthorized', 'invalid mfa token', 401); }
+  if (!payload?.mfa) return err(c, 'unauthorized', 'not an mfa challenge', 401);
+  const user = await c.env.DB.prepare('SELECT * FROM users WHERE id=?').bind(payload.sub).first<any>();
+  if (!user || !user.mfa_enabled || !user.mfa_secret) return err(c, 'unauthorized', 'mfa not enabled', 401);
+  const ok = await verifyTotp(user.mfa_secret, code);
+  if (!ok) return err(c, 'unauthorized', 'invalid code', 401);
+  const token = await sign({ sub: user.id, email: user.email, role: user.role, tenantId: user.tenant_id }, c.env.JWT_SECRET, 'HS256');
+  return c.json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role, tenantId: user.tenant_id } });
+});
+
+app.post('/api/mfa/enroll', async (c) => {
+  const u = requireAuth(c);
+  const user = await c.env.DB.prepare('SELECT * FROM users WHERE id=?').bind(u.sub).first<any>();
+  if (!user) return err(c, 'not_found', 'user not found', 404);
+  const secret = generateSecret();
+  await c.env.DB.prepare('UPDATE users SET mfa_secret=? WHERE id=?').bind(secret, u.sub).run();
+  return c.json({ secret, otpauthUri: otpauthUri(secret, user.email) });
+});
+
+app.post('/api/mfa/verify-enroll', async (c) => {
+  const u = requireAuth(c);
+  const body = await c.req.json().catch(() => ({}));
+  const { code } = body;
+  if (!code) return err(c, 'validation', 'code required');
+  const user = await c.env.DB.prepare('SELECT * FROM users WHERE id=?').bind(u.sub).first<any>();
+  if (!user?.mfa_secret) return err(c, 'validation', 'enroll first', 400);
+  const ok = await verifyTotp(user.mfa_secret, code);
+  if (!ok) return err(c, 'unauthorized', 'invalid code', 401);
+  await c.env.DB.prepare('UPDATE users SET mfa_enabled=1 WHERE id=?').bind(u.sub).run();
+  await audit(c.env, u.tenantId || 'platform', u.email, 'mfa.enable', 'user', u.sub);
+  return c.json({ enabled: true });
+});
+
+app.post('/api/mfa/disable', async (c) => {
+  const u = requireAuth(c);
+  const body = await c.req.json().catch(() => ({}));
+  const targetId = body.userId || u.sub;
+  // only self or tenant_admin/platform_admin
+  if (targetId !== u.sub && u.role !== 'tenant_admin' && u.role !== 'platform_admin') return err(c, 'forbidden', 'forbidden', 403);
+  const row = await c.env.DB.prepare('SELECT * FROM users WHERE id=?').bind(targetId).first<any>();
+  if (!row) return err(c, 'not_found', 'user not found', 404);
+  if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'user not found', 404);
+  await c.env.DB.prepare('UPDATE users SET mfa_enabled=0, mfa_secret=NULL WHERE id=?').bind(targetId).run();
+  await audit(c.env, row.tenant_id, u.email, 'mfa.disable', 'user', targetId);
+  return c.json({ disabled: true });
+});
+
+// ---------- OIDC (optional, configured via env vars) ----------
+app.get('/api/auth/oidc/login', async (c) => {
+  const issuer = c.env.OIDC_ISSUER;
+  const clientId = c.env.OIDC_CLIENT_ID;
+  const redirectUri = c.env.OIDC_REDIRECT_URI;
+  if (!issuer || !clientId || !redirectUri) return err(c, 'not_configured', 'OIDC not configured', 501);
+  // discovery
+  const disc: any = await fetch(issuer.replace(/\/$/, '') + '/.well-known/openid-configuration').then(r => r.json()).catch(() => null);
+  if (!disc?.authorization_endpoint) return err(c, 'internal', 'OIDC discovery failed', 500);
+  const state = crypto.randomUUID();
+  const url = new URL(disc.authorization_endpoint);
+  url.searchParams.set('response_type', 'code');
+  url.searchParams.set('client_id', clientId);
+  url.searchParams.set('redirect_uri', redirectUri);
+  url.searchParams.set('scope', 'openid email profile');
+  url.searchParams.set('state', state);
+  return c.redirect(url.toString());
+});
+
+app.get('/api/auth/oidc/callback', async (c) => {
+  const code = c.req.query('code');
+  const issuer = c.env.OIDC_ISSUER;
+  const clientId = c.env.OIDC_CLIENT_ID;
+  const clientSecret = c.env.OIDC_CLIENT_SECRET;
+  const redirectUri = c.env.OIDC_REDIRECT_URI;
+  if (!code || !issuer || !clientId || !redirectUri) return err(c, 'validation', 'missing code/config', 400);
+  const disc: any = await fetch(issuer.replace(/\/$/, '') + '/.well-known/openid-configuration').then(r => r.json()).catch(() => null);
+  if (!disc?.token_endpoint) return err(c, 'internal', 'OIDC discovery failed', 500);
+  const tokenRes = await fetch(disc.token_endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: redirectUri, client_id: clientId, client_secret: clientSecret || '' }).toString(),
+  });
+  const tokenJson: any = await tokenRes.json().catch(() => ({}));
+  if (!tokenJson.access_token) return err(c, 'unauthorized', 'token exchange failed', 401);
+  const userinfo: any = await fetch(disc.userinfo_endpoint, { headers: { Authorization: 'Bearer ' + tokenJson.access_token } }).then(r => r.json()).catch(() => ({}));
+  const email = userinfo?.email;
+  if (!email) return err(c, 'unauthorized', 'no email from IdP', 401);
+  // find or create user (platform scope: tenant must exist; default to first tenant or create)
+  let user = await c.env.DB.prepare('SELECT * FROM users WHERE email=?').bind(email).first<any>();
+  if (!user) {
+    // create in a default tenant if provided, else reject
+    return err(c, 'not_found', 'user not provisioned in portal', 404);
+  }
+  const jwt = await sign({ sub: user.id, email: user.email, role: user.role, tenantId: user.tenant_id }, c.env.JWT_SECRET, 'HS256');
+  return c.json({ token: jwt, user: { id: user.id, email: user.email, name: user.name, role: user.role, tenantId: user.tenant_id } });
 });
 
 app.all('*', async (c) => {

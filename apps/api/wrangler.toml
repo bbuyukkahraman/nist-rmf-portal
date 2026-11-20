@@ -19,3 +19,10 @@ bucket_name = "nist-rmf-evidence"
 
 [vars]
 ENVIRONMENT = "prod"
+
+# Optional OIDC/IdP configuration (uncomment and set to enable external IdP login)
+# [vars]
+# OIDC_ISSUER = "https://your-idp.example.com"
+# OIDC_CLIENT_ID = "your-client-id"
+# OIDC_CLIENT_SECRET = "your-client-secret"
+# OIDC_REDIRECT_URI = "https://nist-rmf-portal.axoss.workers.dev/api/auth/oidc/callback"
