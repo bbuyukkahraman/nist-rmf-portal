@@ -19,3 +19,7 @@ th,td { padding:.5rem; border-bottom:1px solid var(--border); text-align:left; f
 .spacer { flex:1; }
 .error { color:#f87171; font-size:.85rem; }
 .empty { color:var(--muted); padding:2rem; text-align:center; }
+
+.skip-link { position: absolute; left: -9999px; top: 0; z-index: 1000; }
+.skip-link:focus { left: 0; padding: .5rem 1rem; background: var(--accent); color: #fff; }
+*:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

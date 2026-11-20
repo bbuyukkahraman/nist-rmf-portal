@@ -729,6 +729,76 @@ app.post('/api/admin/run-checks', async (c) => {
   return c.json({ ok: true });
 });
 
+// ---------- dashboard ----------
+app.get('/api/dashboard', async (c) => {
+  const u = requireAuth(c);
+  const tenantId = u.tenantId;
+  const scope = u.role === 'platform_admin' ? '' : ' WHERE tenant_id=?';
+  const params = u.role === 'platform_admin' ? [] : [tenantId];
+  const systems = await c.env.DB.prepare('SELECT COUNT(*) as n FROM systems' + scope).bind(...params).first<{n:number}>();
+  // controls by status
+  let cq = 'SELECT status, COUNT(*) as n FROM controls';
+  const cparams: any[] = [];
+  if (u.role !== 'platform_admin') { cq += ' WHERE tenant_id=?'; cparams.push(tenantId); }
+  cq += ' GROUP BY status';
+  const controlRows = await c.env.DB.prepare(cq).bind(...cparams).all<any>();
+  const controlStatus: Record<string, number> = {};
+  for (const r of (controlRows.results || [])) controlStatus[r.status] = r.n;
+  // systems by impact
+  let iq = 'SELECT impact_c, COUNT(*) as n FROM systems';
+  const iparams: any[] = [];
+  if (u.role !== 'platform_admin') { iq += ' WHERE tenant_id=?'; iparams.push(tenantId); }
+  iq += ' GROUP BY impact_c';
+  const impactRows = await c.env.DB.prepare(iq).bind(...iparams).all<any>();
+  const systemsByImpact: Record<string, number> = {};
+  for (const r of (impactRows.results || [])) systemsByImpact[r.impact_c] = r.n;
+  // POA&M open count
+  let pq = "SELECT COUNT(*) as n FROM poam WHERE status IN ('open','closed_pending_verification')";
+  const pparams: any[] = [];
+  if (u.role !== 'platform_admin') { pq += ' AND tenant_id=?'; pparams.push(tenantId); }
+  const poamOpen = await c.env.DB.prepare(pq).bind(...pparams).first<{n:number}>();
+  // overdue POA&M
+  const today = new Date().toISOString().slice(0, 10);
+  let oq = "SELECT COUNT(*) as n FROM poam WHERE status='open' AND due_date < ?";
+  const oparams: any[] = [today];
+  if (u.role !== 'platform_admin') { oq += ' AND tenant_id=?'; oparams.push(tenantId); }
+  const poamOverdue = await c.env.DB.prepare(oq).bind(...oparams).first<{n:number}>();
+  // authorizations expiring within 30 days
+  const in30 = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
+  let aq = 'SELECT COUNT(*) as n FROM authorizations WHERE expiry <= ?';
+  const aparams: any[] = [in30];
+  if (u.role !== 'platform_admin') { aq += ' AND tenant_id=?'; aparams.push(tenantId); }
+  const authExpiring = await c.env.DB.prepare(aq).bind(...aparams).first<{n:number}>();
+  // recent audit count (last 7 days)
+  const in7 = new Date(Date.now() - 7 * 86400000).toISOString();
+  let rq = 'SELECT COUNT(*) as n FROM audit_log WHERE timestamp >= ?';
+  const rparams: any[] = [in7];
+  if (u.role !== 'platform_admin') { rq += ' AND tenant_id=?'; rparams.push(tenantId); }
+  const recentAudit = await c.env.DB.prepare(rq).bind(...rparams).first<{n:number}>();
+  // notifications unread
+  let nq = 'SELECT COUNT(*) as n FROM notifications WHERE read=0';
+  const nparams: any[] = [];
+  if (u.role !== 'platform_admin') { nq += ' AND tenant_id=?'; nparams.push(tenantId); }
+  const unreadNotif = await c.env.DB.prepare(nq).bind(...nparams).first<{n:number}>();
+  // users count
+  let uq = 'SELECT COUNT(*) as n FROM users';
+  const uparams: any[] = [];
+  if (u.role !== 'platform_admin') { uq += ' WHERE tenant_id=?'; uparams.push(tenantId); }
+  const usersCount = await c.env.DB.prepare(uq).bind(...uparams).first<{n:number}>();
+
+  return c.json({
+    systems: systems?.n ?? 0,
+    users: usersCount?.n ?? 0,
+    controlStatus,
+    systemsByImpact,
+    poamOpen: poamOpen?.n ?? 0,
+    poamOverdue: poamOverdue?.n ?? 0,
+    authExpiring: authExpiring?.n ?? 0,
+    recentAudit: recentAudit?.n ?? 0,
+    unreadNotifications: unreadNotif?.n ?? 0,
+  });
+});
+
 app.all('*', async (c) => {
   // serve assets
   return c.env.ASSETS.fetch(c.req.raw);
