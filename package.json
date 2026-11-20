@@ -1,0 +1,14 @@
+{
+  "name": "nist-rmf-portal",
+  "private": true,
+  "version": "0.1.0",
+  "description": "NIST RMF Risk Management Portal",
+  "scripts": {
+    "dev": "pnpm --filter api dev",
+    "build": "pnpm --filter web build && pnpm --filter api build",
+    "deploy": "pnpm --filter api deploy",
+    "test": "pnpm -r test"
+  },
+  "workspaces": ["apps/*", "packages/*"],
+  "engines": { "node": ">=20" }
+}

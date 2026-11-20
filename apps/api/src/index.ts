@@ -1,0 +1,463 @@
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import { jwt, sign, verify } from 'hono/jwt';
+import type { D1Database, R2Bucket } from '@cloudflare/workers-types';
+
+type Bindings = {
+  DB: D1Database;
+  EVIDENCE: R2Bucket;
+  JWT_SECRET: string;
+  ENVIRONMENT: string;
+  ASSETS: Fetcher;
+};
+
+type Vars = { user: { sub: string; email: string; role: string; tenantId: string | null } };
+
+const app = new Hono<{ Bindings: Bindings; Variables: Vars }>();
+
+app.use('*', cors({ origin: '*', allowHeaders: ['Authorization', 'Content-Type', 'Idempotency-Key'], allowMethods: ['GET','POST','PATCH','DELETE','OPTIONS'] }));
+
+// ---------- helpers ----------
+function uid() { return crypto.randomUUID(); }
+function now() { return new Date().toISOString(); }
+
+async function hashPassword(password: string, salt: string) {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: enc.encode(salt), iterations: 100000, hash: 'SHA-256' }, keyMaterial, 256);
+  return btoa(String.fromCharCode(...new Uint8Array(bits)));
+}
+
+async function audit(env: Bindings, tenantId: string, actor: string, action: string, resource: string, resourceId?: string) {
+  const id = uid();
+  const ts = now();
+  const prev = await env.DB.prepare('SELECT hash FROM audit_log WHERE tenant_id=? ORDER BY timestamp DESC LIMIT 1').bind(tenantId).first<{hash:string}>();
+  const prevHash = prev?.hash ?? '';
+  const payload = `${prevHash}|${tenantId}|${actor}|${action}|${resource}|${resourceId ?? ''}|${ts}`;
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload));
+  const hash = Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+  await env.DB.prepare('INSERT INTO audit_log (id,tenant_id,actor,action,resource,resource_id,timestamp,prev_hash,hash) VALUES (?,?,?,?,?,?,?,?,?)')
+    .bind(id, tenantId, actor, action, resource, resourceId ?? null, ts, prevHash, hash).run();
+}
+
+function err(c: any, code: string, message: string, status = 400) {
+  return c.json({ code, message }, status);
+}
+
+// auth middleware (optional) - sets user if token present
+async function authMiddleware(c: any, next: any) {
+  const auth = c.req.header('Authorization');
+  if (auth && auth.startsWith('Bearer ')) {
+    try {
+      const payload = await verify(auth.slice(7), c.env.JWT_SECRET, 'HS256');
+      c.set('user', payload as any);
+    } catch {
+      // ignore; route decides
+    }
+  }
+  await next();
+}
+app.use('*', authMiddleware);
+
+function requireAuth(c: any) {
+  const u = c.get('user');
+  if (!u) { throw new Response(JSON.stringify({ code: 'unauthorized', message: 'Missing or invalid token' }), { status: 401, headers: { 'Content-Type': 'application/json' } }); }
+  return u;
+}
+
+function requireRole(c: any, roles: string[]) {
+  const u = requireAuth(c);
+  if (!roles.includes(u.role)) { throw new Response(JSON.stringify({ code: 'forbidden', message: 'Insufficient role' }), { status: 403, headers: { 'Content-Type': 'application/json' } }); }
+  return u;
+}
+
+// ---------- health ----------
+app.get('/api/health', (c) => c.json({ status: 'ok', env: c.env.ENVIRONMENT, time: now() }));
+
+// ---------- auth ----------
+app.post('/api/auth/register-tenant', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const { tenantName, adminEmail, adminName, adminPassword } = body;
+  if (!tenantName || !adminEmail || !adminPassword) return err(c, 'validation', 'tenantName, adminEmail, adminPassword required');
+  const tenantId = uid();
+  const slug = tenantName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  const userId = uid();
+  const salt = uid();
+  const hash = await hashPassword(adminPassword, salt);
+  const ts = now();
+  try {
+    await c.env.DB.prepare('INSERT INTO tenants (id,name,slug,created_at) VALUES (?,?,?,?)').bind(tenantId, tenantName, slug, ts).run();
+    await c.env.DB.prepare('INSERT INTO users (id,tenant_id,email,name,password_hash,salt,role,created_at) VALUES (?,?,?,?,?,?,?,?)')
+      .bind(userId, tenantId, adminEmail, adminName || adminEmail, hash, salt, 'tenant_admin', ts).run();
+  } catch (e: any) {
+    return err(c, 'conflict', e?.message || 'registration failed', 409);
+  }
+  const token = await sign({ sub: userId, email: adminEmail, role: 'tenant_admin', tenantId }, c.env.JWT_SECRET, 'HS256');
+  await audit(c.env, tenantId, adminEmail, 'tenant.register', 'tenant', tenantId);
+  return c.json({ token, user: { id: userId, email: adminEmail, role: 'tenant_admin', tenantId }, tenant: { id: tenantId, name: tenantName, slug } }, 201);
+});
+
+app.post('/api/auth/login', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const { email, password } = body;
+  if (!email || !password) return err(c, 'validation', 'email and password required');
+  const user = await c.env.DB.prepare('SELECT * FROM users WHERE email=?').bind(email).first<any>();
+  if (!user) return err(c, 'unauthorized', 'invalid credentials', 401);
+  const hash = await hashPassword(password, user.salt);
+  if (hash !== user.password_hash) return err(c, 'unauthorized', 'invalid credentials', 401);
+  const token = await sign({ sub: user.id, email: user.email, role: user.role, tenantId: user.tenant_id }, c.env.JWT_SECRET, 'HS256');
+  return c.json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role, tenantId: user.tenant_id } });
+});
+
+// ---------- systems ----------
+app.get('/api/systems', async (c) => {
+  const u = requireAuth(c);
+  const tenantId = u.tenantId;
+  if (!tenantId && u.role !== 'platform_admin') return err(c, 'forbidden', 'no tenant', 403);
+  let q = 'SELECT * FROM systems';
+  const params: any[] = [];
+  if (u.role !== 'platform_admin') { q += ' WHERE tenant_id=?'; params.push(tenantId); }
+  q += ' ORDER BY created_at DESC';
+  const res = await c.env.DB.prepare(q).bind(...params).all<any>();
+  return c.json({ items: res.results || [] });
+});
+
+app.post('/api/systems', async (c) => {
+  const u = requireAuth(c);
+  const tenantId = u.tenantId;
+  if (!tenantId) return err(c, 'forbidden', 'no tenant', 403);
+  const roles = ['tenant_admin','isso','system_owner','platform_admin'];
+  if (!roles.includes(u.role)) return err(c, 'forbidden', 'role cannot create systems', 403);
+  const body = await c.req.json().catch(() => ({}));
+  const { name, description, owner, impactC, impactI, impactA } = body;
+  if (!name) return err(c, 'validation', 'name required');
+  const id = uid(); const ts = now();
+  await c.env.DB.prepare('INSERT INTO systems (id,tenant_id,name,description,owner,impact_c,impact_i,impact_a,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
+    .bind(id, tenantId, name, description ?? null, owner ?? null, impactC ?? 'moderate', impactI ?? 'moderate', impactA ?? 'moderate', ts, ts).run();
+  // instantiate controls for baseline? deferred to /baseline
+  await audit(c.env, tenantId, u.email, 'system.create', 'system', id);
+  return c.json({ id, tenantId, name, description, owner, impactC: impactC ?? 'moderate', impactI: impactI ?? 'moderate', impactA: impactA ?? 'moderate', createdAt: ts, updatedAt: ts }, 201);
+});
+
+app.get('/api/systems/:id', async (c) => {
+  const u = requireAuth(c);
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(id).first<any>();
+  if (!row) return err(c, 'not_found', 'system not found', 404);
+  if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
+  return c.json(row);
+});
+
+app.patch('/api/systems/:id', async (c) => {
+  const u = requireAuth(c);
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(id).first<any>();
+  if (!row) return err(c, 'not_found', 'system not found', 404);
+  if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
+  const body = await c.req.json().catch(() => ({}));
+  const name = body.name ?? row.name;
+  const description = body.description ?? row.description;
+  const owner = body.owner ?? row.owner;
+  const impactC = body.impactC ?? row.impact_c;
+  const impactI = body.impactI ?? row.impact_i;
+  const impactA = body.impactA ?? row.impact_a;
+  const ts = now();
+  await c.env.DB.prepare('UPDATE systems SET name=?,description=?,owner=?,impact_c=?,impact_i=?,impact_a=?,updated_at=? WHERE id=?')
+    .bind(name, description, owner, impactC, impactI, impactA, ts, id).run();
+  await audit(c.env, row.tenant_id, u.email, 'system.update', 'system', id);
+  return c.json({ id, updated: true });
+});
+
+// categorize (record impact already on system; add monitoring event)
+app.post('/api/systems/:id/categorize', async (c) => {
+  const u = requireAuth(c);
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(id).first<any>();
+  if (!row) return err(c, 'not_found', 'system not found', 404);
+  if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
+  const body = await c.req.json().catch(() => ({}));
+  if (body.impactC) await c.env.DB.prepare('UPDATE systems SET impact_c=?,impact_i=?,impact_a=?,updated_at=? WHERE id=?')
+    .bind(body.impactC, body.impactI ?? row.impact_i, body.impactA ?? row.impact_a, now(), id).run();
+  await audit(c.env, row.tenant_id, u.email, 'system.categorize', 'system', id);
+  return c.json({ id, categorized: true });
+});
+
+// baseline selection: instantiate SP800-53 controls by impact
+const BASELINE_CONTROLS: { id: string; family: string; title: string }[] = [
+  { id: 'AC-1', family: 'Access Control', title: 'Policy and Procedures' },
+  { id: 'AC-2', family: 'Access Control', title: 'Account Management' },
+  { id: 'AC-3', family: 'Access Control', title: 'Access Enforcement' },
+  { id: 'AU-1', family: 'Audit and Accountability', title: 'Policy and Procedures' },
+  { id: 'AU-2', family: 'Audit and Accountability', title: 'Event Logging' },
+  { id: 'AU-9', family: 'Audit and Accountability', title: 'Protection of Audit Information' },
+  { id: 'CM-1', family: 'Configuration Management', title: 'Policy and Procedures' },
+  { id: 'CM-2', family: 'Configuration Management', title: 'Baseline Configuration' },
+  { id: 'IA-1', family: 'Identification and Authentication', title: 'Policy and Procedures' },
+  { id: 'IA-2', family: 'Identification and Authentication', title: 'Identification and Authentication (Organizational Users)' },
+  { id: 'IA-5', family: 'Identification and Authentication', title: 'Authenticator Management' },
+  { id: 'IR-1', family: 'Incident Response', title: 'Policy and Procedures' },
+  { id: 'IR-4', family: 'Incident Response', title: 'Incident Handling' },
+  { id: 'RA-1', family: 'Risk Assessment', title: 'Policy and Procedures' },
+  { id: 'RA-3', family: 'Risk Assessment', title: 'Risk Assessment' },
+  { id: 'SC-1', family: 'System and Communications Protection', title: 'Policy and Procedures' },
+  { id: 'SC-8', family: 'System and Communications Protection', title: 'Transmission Confidentiality and Integrity' },
+  { id: 'SC-28', family: 'System and Communications Protection', title: 'Protection of Information at Rest' },
+  { id: 'SI-1', family: 'System and Information Integrity', title: 'Policy and Procedures' },
+  { id: 'SI-4', family: 'System and Information Integrity', title: 'Information System Monitoring' },
+];
+
+app.post('/api/systems/:id/baseline', async (c) => {
+  const u = requireAuth(c);
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(id).first<any>();
+  if (!row) return err(c, 'not_found', 'system not found', 404);
+  if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
+  const existing = await c.env.DB.prepare('SELECT COUNT(*) as n FROM controls WHERE system_id=?').bind(id).first<{n:number}>();
+  if ((existing?.n ?? 0) > 0) return err(c, 'conflict', 'baseline already selected', 409);
+  const ts = now();
+  const stmts = BASELINE_CONTROLS.map(ctrl =>
+    c.env.DB.prepare('INSERT INTO controls (id,system_id,tenant_id,control_id,family,title,status,updated_at) VALUES (?,?,?,?,?,?,?,?)')
+      .bind(uid(), id, row.tenant_id, ctrl.id, ctrl.family, ctrl.title, 'not_assessed', ts)
+  );
+  await c.env.DB.batch(stmts);
+  await audit(c.env, row.tenant_id, u.email, 'system.baseline', 'system', id);
+  return c.json({ systemId: id, controlsCreated: BASELINE_CONTROLS.length }, 201);
+});
+
+// controls
+app.get('/api/systems/:id/controls', async (c) => {
+  const u = requireAuth(c);
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(id).first<any>();
+  if (!row) return err(c, 'not_found', 'system not found', 404);
+  if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
+  const res = await c.env.DB.prepare('SELECT * FROM controls WHERE system_id=? ORDER BY control_id').bind(id).all<any>();
+  return c.json({ items: res.results || [] });
+});
+
+app.patch('/api/controls/:id', async (c) => {
+  const u = requireAuth(c);
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT * FROM controls WHERE id=?').bind(id).first<any>();
+  if (!row) return err(c, 'not_found', 'control not found', 404);
+  if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'control not found', 404);
+  const allowed = ['tenant_admin','isso','assessor','system_owner','platform_admin'];
+  if (!allowed.includes(u.role)) return err(c, 'forbidden', 'role cannot update controls', 403);
+  const body = await c.req.json().catch(() => ({}));
+  const status = body.status ?? row.status;
+  const implementation = body.implementation ?? row.implementation;
+  const evidenceKey = body.evidenceKey ?? row.evidence_key;
+  const ts = now();
+  await c.env.DB.prepare('UPDATE controls SET status=?,implementation=?,evidence_key=?,updated_at=? WHERE id=?')
+    .bind(status, implementation, evidenceKey, ts, id).run();
+  await audit(c.env, row.tenant_id, u.email, 'control.update', 'control', id);
+  return c.json({ id, updated: true });
+});
+
+// assessments
+app.get('/api/systems/:id/assessments', async (c) => {
+  const u = requireAuth(c);
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(id).first<any>();
+  if (!row) return err(c, 'not_found', 'system not found', 404);
+  if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
+  const res = await c.env.DB.prepare('SELECT * FROM assessments WHERE system_id=? ORDER BY assessed_at DESC').bind(id).all<any>();
+  const items = (res.results || []).map((r:any) => ({ ...r, findings: JSON.parse(r.findings || '[]') }));
+  return c.json({ items });
+});
+
+app.post('/api/systems/:id/assessments', async (c) => {
+  const u = requireAuth(c);
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(id).first<any>();
+  if (!row) return err(c, 'not_found', 'system not found', 404);
+  if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
+  const allowed = ['tenant_admin','isso','assessor','platform_admin'];
+  if (!allowed.includes(u.role)) return err(c, 'forbidden', 'role cannot record assessments', 403);
+  const body = await c.req.json().catch(() => ({}));
+  const { summary, findings } = body;
+  if (!summary) return err(c, 'validation', 'summary required');
+  const aid = uid(); const ts = now();
+  await c.env.DB.prepare('INSERT INTO assessments (id,system_id,tenant_id,assessed_at,assessor,summary,findings) VALUES (?,?,?,?,?,?,?)')
+    .bind(aid, id, row.tenant_id, ts, u.email, summary, JSON.stringify(findings || [])).run();
+  await audit(c.env, row.tenant_id, u.email, 'assessment.create', 'system', id);
+  return c.json({ id: aid, systemId: id, assessedAt: ts }, 201);
+});
+
+// POA&M
+app.get('/api/systems/:id/poam', async (c) => {
+  const u = requireAuth(c);
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(id).first<any>();
+  if (!row) return err(c, 'not_found', 'system not found', 404);
+  if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
+  const res = await c.env.DB.prepare('SELECT * FROM poam WHERE system_id=? ORDER BY created_at DESC').bind(id).all<any>();
+  return c.json({ items: res.results || [] });
+});
+
+app.post('/api/poam', async (c) => {
+  const u = requireAuth(c);
+  const body = await c.req.json().catch(() => ({}));
+  const { systemId, controlId, title, description, owner, dueDate } = body;
+  if (!systemId || !title || !owner || !dueDate) return err(c, 'validation', 'systemId,title,owner,dueDate required');
+  const row = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(systemId).first<any>();
+  if (!row) return err(c, 'not_found', 'system not found', 404);
+  if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
+  const allowed = ['tenant_admin','isso','platform_admin'];
+  if (!allowed.includes(u.role)) return err(c, 'forbidden', 'role cannot create POA&M', 403);
+  const id = uid(); const ts = now();
+  await c.env.DB.prepare('INSERT INTO poam (id,system_id,tenant_id,control_id,title,description,owner,due_date,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+    .bind(id, systemId, row.tenant_id, controlId ?? null, title, description ?? null, owner, dueDate, 'open', ts, ts).run();
+  await audit(c.env, row.tenant_id, u.email, 'poam.create', 'poam', id);
+  return c.json({ id, systemId, title, status: 'open', createdAt: ts }, 201);
+});
+
+app.patch('/api/poam/:id', async (c) => {
+  const u = requireAuth(c);
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT * FROM poam WHERE id=?').bind(id).first<any>();
+  if (!row) return err(c, 'not_found', 'poam not found', 404);
+  const sys = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(row.system_id).first<any>();
+  if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'poam not found', 404);
+  const body = await c.req.json().catch(() => ({}));
+  const status = body.status ?? row.status;
+  const owner = body.owner ?? row.owner;
+  const dueDate = body.dueDate ?? row.due_date;
+  const description = body.description ?? row.description;
+  const ts = now();
+  // close requires assessor confirmation if moving to closed
+  if (status === 'closed' && u.role !== 'assessor' && u.role !== 'tenant_admin' && u.role !== 'platform_admin') {
+    return err(c, 'forbidden', 'only assessor can fully close', 403);
+  }
+  await c.env.DB.prepare('UPDATE poam SET status=?,owner=?,due_date=?,description=?,updated_at=? WHERE id=?')
+    .bind(status, owner, dueDate, description, ts, id).run();
+  await audit(c.env, row.tenant_id, u.email, 'poam.update', 'poam', id);
+  return c.json({ id, updated: true });
+});
+
+// authorization
+app.get('/api/systems/:id/authorizations', async (c) => {
+  const u = requireAuth(c);
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(id).first<any>();
+  if (!row) return err(c, 'not_found', 'system not found', 404);
+  if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
+  const res = await c.env.DB.prepare('SELECT * FROM authorizations WHERE system_id=? ORDER BY decided_at DESC').bind(id).all<any>();
+  return c.json({ items: res.results || [] });
+});
+
+app.post('/api/systems/:id/authorization', async (c) => {
+  const u = requireAuth(c);
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(id).first<any>();
+  if (!row) return err(c, 'not_found', 'system not found', 404);
+  if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
+  // AO-only write
+  if (u.role !== 'ao' && u.role !== 'tenant_admin' && u.role !== 'platform_admin') {
+    return err(c, 'forbidden', 'only AO can record authorization', 403);
+  }
+  const body = await c.req.json().catch(() => ({}));
+  const { decision, expiry, conditions } = body;
+  if (!decision || !expiry) return err(c, 'validation', 'decision and expiry required');
+  const aid = uid(); const ts = now();
+  await c.env.DB.prepare('INSERT INTO authorizations (id,system_id,tenant_id,decision,decided_by,decided_at,expiry,conditions) VALUES (?,?,?,?,?,?,?,?)')
+    .bind(aid, id, row.tenant_id, decision, u.email, ts, expiry, conditions ?? null).run();
+  // monitoring event
+  await c.env.DB.prepare('INSERT INTO monitoring_events (id,system_id,tenant_id,event_type,description,created_at) VALUES (?,?,?,?,?,?)')
+    .bind(uid(), id, row.tenant_id, 'authorization', `Decision ${decision} until ${expiry}`, ts).run();
+  await audit(c.env, row.tenant_id, u.email, 'authorization.record', 'system', id);
+  return c.json({ id: aid, systemId: id, decision, expiry }, 201);
+});
+
+// monitoring events
+app.get('/api/systems/:id/monitoring', async (c) => {
+  const u = requireAuth(c);
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(id).first<any>();
+  if (!row) return err(c, 'not_found', 'system not found', 404);
+  if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
+  const res = await c.env.DB.prepare('SELECT * FROM monitoring_events WHERE system_id=? ORDER BY created_at DESC').bind(id).all<any>();
+  return c.json({ items: res.results || [] });
+});
+
+app.post('/api/systems/:id/monitoring', async (c) => {
+  const u = requireAuth(c);
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(id).first<any>();
+  if (!row) return err(c, 'not_found', 'system not found', 404);
+  if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
+  const body = await c.req.json().catch(() => ({}));
+  const { eventType, description } = body;
+  if (!eventType) return err(c, 'validation', 'eventType required');
+  const eid = uid(); const ts = now();
+  await c.env.DB.prepare('INSERT INTO monitoring_events (id,system_id,tenant_id,event_type,description,created_at) VALUES (?,?,?,?,?,?)')
+    .bind(eid, id, row.tenant_id, eventType, description ?? null, ts).run();
+  await audit(c.env, row.tenant_id, u.email, 'monitoring.event', 'system', id);
+  return c.json({ id: eid, createdAt: ts }, 201);
+});
+
+// audit log
+app.get('/api/audit', async (c) => {
+  const u = requireAuth(c);
+  if (u.role !== 'tenant_admin' && u.role !== 'auditor' && u.role !== 'platform_admin') return err(c, 'forbidden', 'role cannot view audit', 403);
+  const tenantId = u.tenantId;
+  let q = 'SELECT * FROM audit_log';
+  const params: any[] = [];
+  if (u.role !== 'platform_admin') { q += ' WHERE tenant_id=?'; params.push(tenantId); }
+  q += ' ORDER BY timestamp DESC LIMIT 200';
+  const res = await c.env.DB.prepare(q).bind(...params).all<any>();
+  return c.json({ items: res.results || [] });
+});
+
+// evidence upload (R2)
+app.post('/api/evidence/upload', async (c) => {
+  const u = requireAuth(c);
+  const tenantId = u.tenantId;
+  if (!tenantId) return err(c, 'forbidden', 'no tenant', 403);
+  const allowed = ['tenant_admin','isso','assessor','platform_admin'];
+  if (!allowed.includes(u.role)) return err(c, 'forbidden', 'role cannot upload evidence', 403);
+  const form = await c.req.parseBody().catch(() => ({} as any));
+  const file = form?.file;
+  if (!file || !(file instanceof File)) return err(c, 'validation', 'file required');
+  if (file.size > 10 * 1024 * 1024) return err(c, 'validation', 'file too large (max 10MB)');
+  const key = `${tenantId}/${uid()}-${file.name}`;
+  await c.env.EVIDENCE.put(key, file.stream(), { httpMetadata: { contentType: file.type } });
+  await audit(c.env, tenantId, u.email, 'evidence.upload', 'evidence', key);
+  return c.json({ key }, 201);
+});
+
+app.get('/api/evidence/:key{.+}', async (c) => {
+  const u = requireAuth(c);
+  const key = c.req.param('key');
+  // tenant scoping: key must start with user's tenant
+  if (u.role !== 'platform_admin' && !(u.tenantId && key.startsWith(u.tenantId + '/'))) {
+    return err(c, 'forbidden', 'access denied', 403);
+  }
+  const obj = await c.env.EVIDENCE.get(key);
+  if (!obj) return err(c, 'not_found', 'not found', 404);
+  const headers = new Headers();
+  obj.writeHttpMetadata(headers);
+  return new Response(obj.body, { headers });
+});
+
+// tenants (platform admin list)
+app.get('/api/tenants', async (c) => {
+  const u = requireAuth(c);
+  if (u.role !== 'platform_admin') return err(c, 'forbidden', 'platform admin only', 403);
+  const res = await c.env.DB.prepare('SELECT * FROM tenants ORDER BY created_at DESC').all<any>();
+  return c.json({ items: res.results || [] });
+});
+
+// SPA fallback
+app.all('*', async (c) => {
+  // serve assets
+  return c.env.ASSETS.fetch(c.req.raw);
+});
+
+app.onError((err, c) => {
+  if (err instanceof Response) return err;
+  console.error(err);
+  return c.json({ code: "internal", message: String(err?.message || err) }, 500);
+});
+
+export default app;

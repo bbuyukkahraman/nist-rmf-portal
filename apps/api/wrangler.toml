@@ -1,0 +1,21 @@
+name = "nist-rmf-portal"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "../../apps/web/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nist-rmf-db"
+database_id = "8ec58aaa-a6dd-4283-9515-d6866affe319"
+
+[[r2_buckets]]
+binding = "EVIDENCE"
+bucket_name = "nist-rmf-evidence"
+
+[vars]
+ENVIRONMENT = "prod"
