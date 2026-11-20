@@ -449,6 +449,74 @@ app.get('/api/tenants', async (c) => {
 });
 
 // SPA fallback
+// ---------- users (tenant-scoped management) ----------
+app.get('/api/users', async (c) => {
+  const u = requireAuth(c);
+  if (u.role !== 'tenant_admin' && u.role !== 'platform_admin') return err(c, 'forbidden', 'admin only', 403);
+  let q = 'SELECT id,tenant_id,email,name,role,created_at FROM users';
+  const params: any[] = [];
+  if (u.role !== 'platform_admin') { q += ' WHERE tenant_id=?'; params.push(u.tenantId); }
+  q += ' ORDER BY created_at DESC';
+  const res = await c.env.DB.prepare(q).bind(...params).all<any>();
+  return c.json({ items: res.results || [] });
+});
+
+app.post('/api/users', async (c) => {
+  const u = requireAuth(c);
+  if (u.role !== 'tenant_admin' && u.role !== 'platform_admin') return err(c, 'forbidden', 'admin only', 403);
+  const body = await c.req.json().catch(() => ({}));
+  const { email, name, password, role, tenantId: reqTenant } = body;
+  if (!email || !password) return err(c, 'validation', 'email and password required');
+  const tenantId = u.role === 'platform_admin' ? (reqTenant || u.tenantId) : u.tenantId;
+  if (!tenantId) return err(c, 'validation', 'tenantId required');
+  const allowedRoles = ['isso','system_owner','assessor','auditor','ao','tenant_admin'];
+  const r = (role && allowedRoles.includes(role)) ? role : 'isso';
+  // tenant_admin can only assign non-admin roles unless platform_admin
+  if (role === 'tenant_admin' && u.role !== 'platform_admin') return err(c, 'forbidden', 'cannot assign tenant_admin', 403);
+  const id = crypto.randomUUID();
+  const salt = crypto.randomUUID();
+  const hash = await hashPassword(password, salt);
+  const ts = new Date().toISOString();
+  try {
+    await c.env.DB.prepare('INSERT INTO users (id,tenant_id,email,name,password_hash,salt,role,created_at) VALUES (?,?,?,?,?,?,?,?)')
+      .bind(id, tenantId, email, name || email, hash, salt, r, ts).run();
+  } catch (e: any) {
+    return err(c, 'conflict', e?.message || 'create failed', 409);
+  }
+  await audit(c.env, tenantId, u.email, 'user.create', 'user', id);
+  return c.json({ id, email, name: name || email, role: r, tenantId }, 201);
+});
+
+app.patch('/api/users/:id', async (c) => {
+  const u = requireAuth(c);
+  if (u.role !== 'tenant_admin' && u.role !== 'platform_admin') return err(c, 'forbidden', 'admin only', 403);
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT * FROM users WHERE id=?').bind(id).first<any>();
+  if (!row) return err(c, 'not_found', 'user not found', 404);
+  if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'user not found', 404);
+  const body = await c.req.json().catch(() => ({}));
+  const role = body.role ?? row.role;
+  if (role === 'platform_admin') return err(c, 'forbidden', 'cannot assign platform_admin', 403);
+  if (role === 'tenant_admin' && u.role !== 'platform_admin') return err(c, 'forbidden', 'cannot assign tenant_admin', 403);
+  await c.env.DB.prepare('UPDATE users SET role=?, name=? WHERE id=?')
+    .bind(role, body.name ?? row.name, id).run();
+  await audit(c.env, row.tenant_id, u.email, 'user.update', 'user', id);
+  return c.json({ id, updated: true });
+});
+
+app.delete('/api/users/:id', async (c) => {
+  const u = requireAuth(c);
+  if (u.role !== 'tenant_admin' && u.role !== 'platform_admin') return err(c, 'forbidden', 'admin only', 403);
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT * FROM users WHERE id=?').bind(id).first<any>();
+  if (!row) return err(c, 'not_found', 'user not found', 404);
+  if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'user not found', 404);
+  if (row.id === u.sub) return err(c, 'conflict', 'cannot delete self', 409);
+  await c.env.DB.prepare('DELETE FROM users WHERE id=?').bind(id).run();
+  await audit(c.env, row.tenant_id, u.email, 'user.delete', 'user', id);
+  return c.json({ id, deleted: true });
+});
+
 app.all('*', async (c) => {
   // serve assets
   return c.env.ASSETS.fetch(c.req.raw);
