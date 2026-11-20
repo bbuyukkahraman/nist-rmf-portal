@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { api } from '../api';
+import { api, downloadCsv } from '../api';
 
 export default function Audit() {
   const [items, setItems] = useState<any[]>([]);
@@ -10,6 +10,9 @@ export default function Audit() {
   return (
     <div>
       <h1>Audit Log</h1>
+      <div className="row" style={{ marginBottom: "1rem" }}>
+        <button className="btn secondary" onClick={() => downloadCsv("/api/export/audit","audit.csv")}>Export CSV</button>
+      </div>
       {err && <div className="error">{err}</div>}
       <div className="card">
         {items.length === 0 ? <div className="empty">No entries.</div> : (

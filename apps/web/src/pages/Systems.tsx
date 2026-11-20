@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api } from '../api';
+import { api, downloadCsv } from '../api';
 
 export default function Systems() {
   const [items, setItems] = useState<any[]>([]);
@@ -19,6 +19,9 @@ export default function Systems() {
   return (
     <div>
       <h1>Systems</h1>
+      <div className="row" style={{ marginBottom: "1rem" }}>
+        <button className="btn secondary" onClick={() => downloadCsv("/api/export/systems","systems.csv")}>Export Systems CSV</button>
+      </div>
       <div className="card">
         <form onSubmit={create} className="row">
           <input className="input" placeholder="New system name" value={name} onChange={e => setName(e.target.value)} style={{ flex: 1 }} />

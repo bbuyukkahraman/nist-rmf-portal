@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
-import { api } from '../api';
+import { api, downloadCsv } from '../api';
 
 export default function SystemDetail() {
   const { id } = useParams();
@@ -133,6 +133,9 @@ export default function SystemDetail() {
 
       {tab === 'controls' && (
         <div className="card">
+          <div className="row" style={{ marginBottom: ".5rem" }}>
+            <button className="btn secondary" onClick={() => downloadCsv(`/api/export/controls?systemId=${id}`, "controls.csv")}>Export Controls CSV</button>
+          </div>
           {controls.length === 0 ? <div className="empty">No controls. Select baseline first.</div> : (
             <table>
               <thead><tr><th>Control</th><th>Family</th><th>Title</th><th>Status</th><th>Evidence</th><th>Action</th></tr></thead>

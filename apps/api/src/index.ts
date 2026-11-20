@@ -21,6 +21,16 @@ type Vars = { user: { sub: string; email: string; role: string; tenantId: string
 
 const app = new Hono<{ Bindings: Bindings; Variables: Vars }>();
 
+// structured request logging
+app.use('*', async (c, next) => {
+  const start = Date.now();
+  const reqId = crypto.randomUUID().slice(0, 8);
+  c.header('X-Request-Id', reqId);
+  await next();
+  const ms = Date.now() - start;
+  console.log(JSON.stringify({ ts: new Date().toISOString(), reqId, method: c.req.method, path: c.req.path, status: c.res.status, ms }));
+});
+
 app.use('*', cors({ origin: '*', allowHeaders: ['Authorization', 'Content-Type', 'Idempotency-Key'], allowMethods: ['GET','POST','PATCH','DELETE','OPTIONS'] }));
 
 // ---------- helpers ----------
@@ -129,7 +139,7 @@ app.get('/api/systems', async (c) => {
   const params: any[] = [];
   if (u.role !== 'platform_admin') { q += ' WHERE tenant_id=?'; params.push(tenantId); }
   q += ' ORDER BY created_at DESC';
-  const res = await c.env.DB.prepare(q).bind(...params).all<any>();
+  const res = await c.env.DB.prepare(q).bind(...params).all();
   return c.json({ items: res.results || [] });
 });
 
@@ -247,7 +257,7 @@ app.get('/api/systems/:id/controls', async (c) => {
   const row = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(id).first<any>();
   if (!row) return err(c, 'not_found', 'system not found', 404);
   if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
-  const res = await c.env.DB.prepare('SELECT * FROM controls WHERE system_id=? ORDER BY control_id').bind(id).all<any>();
+  const res = await c.env.DB.prepare('SELECT * FROM controls WHERE system_id=? ORDER BY control_id').bind(id).all();
   return c.json({ items: res.results || [] });
 });
 
@@ -277,7 +287,7 @@ app.get('/api/systems/:id/assessments', async (c) => {
   const row = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(id).first<any>();
   if (!row) return err(c, 'not_found', 'system not found', 404);
   if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
-  const res = await c.env.DB.prepare('SELECT * FROM assessments WHERE system_id=? ORDER BY assessed_at DESC').bind(id).all<any>();
+  const res = await c.env.DB.prepare('SELECT * FROM assessments WHERE system_id=? ORDER BY assessed_at DESC').bind(id).all();
   const items = (res.results || []).map((r:any) => ({ ...r, findings: JSON.parse(r.findings || '[]') }));
   return c.json({ items });
 });
@@ -307,7 +317,7 @@ app.get('/api/systems/:id/poam', async (c) => {
   const row = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(id).first<any>();
   if (!row) return err(c, 'not_found', 'system not found', 404);
   if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
-  const res = await c.env.DB.prepare('SELECT * FROM poam WHERE system_id=? ORDER BY created_at DESC').bind(id).all<any>();
+  const res = await c.env.DB.prepare('SELECT * FROM poam WHERE system_id=? ORDER BY created_at DESC').bind(id).all();
   return c.json({ items: res.results || [] });
 });
 
@@ -358,7 +368,7 @@ app.get('/api/systems/:id/authorizations', async (c) => {
   const row = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(id).first<any>();
   if (!row) return err(c, 'not_found', 'system not found', 404);
   if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
-  const res = await c.env.DB.prepare('SELECT * FROM authorizations WHERE system_id=? ORDER BY decided_at DESC').bind(id).all<any>();
+  const res = await c.env.DB.prepare('SELECT * FROM authorizations WHERE system_id=? ORDER BY decided_at DESC').bind(id).all();
   return c.json({ items: res.results || [] });
 });
 
@@ -392,7 +402,7 @@ app.get('/api/systems/:id/monitoring', async (c) => {
   const row = await c.env.DB.prepare('SELECT * FROM systems WHERE id=?').bind(id).first<any>();
   if (!row) return err(c, 'not_found', 'system not found', 404);
   if (u.role !== 'platform_admin' && row.tenant_id !== u.tenantId) return err(c, 'not_found', 'system not found', 404);
-  const res = await c.env.DB.prepare('SELECT * FROM monitoring_events WHERE system_id=? ORDER BY created_at DESC').bind(id).all<any>();
+  const res = await c.env.DB.prepare('SELECT * FROM monitoring_events WHERE system_id=? ORDER BY created_at DESC').bind(id).all();
   return c.json({ items: res.results || [] });
 });
 
@@ -421,7 +431,7 @@ app.get('/api/audit', async (c) => {
   const params: any[] = [];
   if (u.role !== 'platform_admin') { q += ' WHERE tenant_id=?'; params.push(tenantId); }
   q += ' ORDER BY timestamp DESC LIMIT 200';
-  const res = await c.env.DB.prepare(q).bind(...params).all<any>();
+  const res = await c.env.DB.prepare(q).bind(...params).all();
   return c.json({ items: res.results || [] });
 });
 
@@ -460,7 +470,7 @@ app.get('/api/evidence/:key{.+}', async (c) => {
 app.get('/api/tenants', async (c) => {
   const u = requireAuth(c);
   if (u.role !== 'platform_admin') return err(c, 'forbidden', 'platform admin only', 403);
-  const res = await c.env.DB.prepare('SELECT * FROM tenants ORDER BY created_at DESC').all<any>();
+  const res = await c.env.DB.prepare('SELECT * FROM tenants ORDER BY created_at DESC').all();
   return c.json({ items: res.results || [] });
 });
 
@@ -473,7 +483,7 @@ app.get('/api/users', async (c) => {
   const params: any[] = [];
   if (u.role !== 'platform_admin') { q += ' WHERE tenant_id=?'; params.push(u.tenantId); }
   q += ' ORDER BY created_at DESC';
-  const res = await c.env.DB.prepare(q).bind(...params).all<any>();
+  const res = await c.env.DB.prepare(q).bind(...params).all();
   return c.json({ items: res.results || [] });
 });
 
@@ -634,6 +644,91 @@ app.get('/api/auth/oidc/callback', async (c) => {
   return c.json({ token: jwt, user: { id: user.id, email: user.email, name: user.name, role: user.role, tenantId: user.tenant_id } });
 });
 
+
+// ---------- notifications ----------
+app.get('/api/notifications', async (c) => {
+  const u = requireAuth(c);
+  let q = 'SELECT * FROM notifications WHERE tenant_id=?';
+  const params: any[] = [u.tenantId];
+  if (u.sub) { q += ' AND (user_id IS NULL OR user_id=?)'; params.push(u.sub); }
+  q += ' ORDER BY created_at DESC LIMIT 100';
+  const res = await c.env.DB.prepare(q).bind(...params).all();
+  return c.json({ items: res.results || [] });
+});
+
+app.post('/api/notifications/:id/read', async (c) => {
+  const u = requireAuth(c);
+  const id = c.req.param('id');
+  await c.env.DB.prepare('UPDATE notifications SET read=1 WHERE id=? AND tenant_id=?').bind(id, u.tenantId).run();
+  return c.json({ ok: true });
+});
+
+app.post('/api/notifications/read-all', async (c) => {
+  const u = requireAuth(c);
+  await c.env.DB.prepare('UPDATE notifications SET read=1 WHERE tenant_id=?').bind(u.tenantId).run();
+  return c.json({ ok: true });
+});
+
+// ---------- CSV exports ----------
+function csvEscape(v: any): string {
+  if (v === null || v === undefined) return '';
+  const s = String(v);
+  if (s.includes(',') || s.includes('"') || s.includes('\n')) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+function toCsv(headers: string[], rows: any[][]): string {
+  return [headers.join(','), ...rows.map(r => r.map(csvEscape).join(','))].join('\n');
+}
+
+app.get('/api/export/systems', async (c) => {
+  const u = requireAuth(c);
+  let q = 'SELECT id,name,description,owner,impact_c,impact_i,impact_a,created_at,updated_at FROM systems';
+  const params: any[] = [];
+  if (u.role !== 'platform_admin') { q += ' WHERE tenant_id=?'; params.push(u.tenantId); }
+  const res = await c.env.DB.prepare(q).bind(...params).all();
+  const rows = (res.results || []).map((r: any) => [r.id, r.name, r.description, r.owner, r.impact_c, r.impact_i, r.impact_a, r.created_at, r.updated_at]);
+  const csv = toCsv(['id','name','description','owner','impact_c','impact_i','impact_a','created_at','updated_at'], rows);
+  return new Response(csv, { headers: { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="systems.csv"' } });
+});
+
+app.get('/api/export/controls', async (c) => {
+  const u = requireAuth(c);
+  const systemId = c.req.query('systemId');
+  let q = 'SELECT id,system_id,control_id,family,title,status,implementation,updated_at FROM controls';
+  const params: any[] = [];
+  const conds: string[] = [];
+  if (u.role !== 'platform_admin') { conds.push('tenant_id=?'); params.push(u.tenantId); }
+  if (systemId) { conds.push('system_id=?'); params.push(systemId); }
+  if (conds.length) q += ' WHERE ' + conds.join(' AND ');
+  q += ' ORDER BY control_id';
+  const res = await c.env.DB.prepare(q).bind(...params).all();
+  const rows = (res.results || []).map((r: any) => [r.id, r.system_id, r.control_id, r.family, r.title, r.status, r.implementation, r.updated_at]);
+  const csv = toCsv(['id','system_id','control_id','family','title','status','implementation','updated_at'], rows);
+  return new Response(csv, { headers: { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="controls.csv"' } });
+});
+
+app.get('/api/export/audit', async (c) => {
+  const u = requireAuth(c);
+  if (u.role !== 'tenant_admin' && u.role !== 'auditor' && u.role !== 'platform_admin') return err(c, 'forbidden', 'forbidden', 403);
+  let q = 'SELECT id,tenant_id,actor,action,resource,resource_id,timestamp,hash FROM audit_log';
+  const params: any[] = [];
+  if (u.role !== 'platform_admin') { q += ' WHERE tenant_id=?'; params.push(u.tenantId); }
+  q += ' ORDER BY timestamp DESC LIMIT 5000';
+  const res = await c.env.DB.prepare(q).bind(...params).all();
+  const rows = (res.results || []).map((r: any) => [r.id, r.tenant_id, r.actor, r.action, r.resource, r.resource_id, r.timestamp, r.hash]);
+  const csv = toCsv(['id','tenant_id','actor','action','resource','resource_id','timestamp','hash'], rows);
+  return new Response(csv, { headers: { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="audit.csv"' } });
+});
+
+// manual trigger for scheduled checks (demo/admin)
+app.post('/api/admin/run-checks', async (c) => {
+  const u = requireAuth(c);
+  if (u.role !== 'tenant_admin' && u.role !== 'platform_admin') return err(c, 'forbidden', 'admin only', 403);
+  // run checks scoped: reuse runChecks but it iterates all tenants; for demo run globally
+  await runChecks(c.env);
+  return c.json({ ok: true });
+});
+
 app.all('*', async (c) => {
   // serve assets
   return c.env.ASSETS.fetch(c.req.raw);
@@ -645,4 +740,41 @@ app.onError((err, c) => {
   return c.json({ code: "internal", message: String(err?.message || err) }, 500);
 });
 
-export default app;
+
+// ---------- scheduled checks (cron) ----------
+async function runChecks(env: any) {
+  const tenants = await env.DB.prepare('SELECT id FROM tenants').all();
+  const now = new Date();
+  const in7 = new Date(now.getTime() + 7 * 86400000).toISOString().slice(0, 10);
+  const in30 = new Date(now.getTime() + 30 * 86400000).toISOString().slice(0, 10);
+  const today = now.toISOString().slice(0, 10);
+  for (const t of (tenants.results || [])) {
+    const tid = t.id;
+    // overdue / due-soon POA&M
+    const poams = await env.DB.prepare("SELECT id,title,due_date,status FROM poam WHERE tenant_id=? AND status IN ('open','closed_pending_verification')").bind(tid).all();
+    for (const p of (poams.results || [])) {
+      if (p.due_date <= in7) {
+        const overdue = p.due_date < today;
+        const id = crypto.randomUUID();
+        await env.DB.prepare('INSERT INTO notifications (id,tenant_id,title,message,kind,created_at) VALUES (?,?,?,?,?,?)')
+          .bind(id, tid, overdue ? 'Overdue POA&M item' : 'POA&M due soon', `${p.title} (due ${p.due_date})`, overdue ? 'warning' : 'info', new Date().toISOString()).run();
+      }
+    }
+    // expiring authorizations
+    const auths = await env.DB.prepare('SELECT id,system_id,decision,expiry FROM authorizations WHERE tenant_id=?').bind(tid).all();
+    for (const a of (auths.results || [])) {
+      if (a.expiry <= in30) {
+        const id = crypto.randomUUID();
+        await env.DB.prepare('INSERT INTO notifications (id,tenant_id,title,message,kind,created_at) VALUES (?,?,?,?,?,?)')
+          .bind(id, tid, 'Authorization expiring', `System ${a.system_id}: ${a.decision.toUpperCase()} expires ${a.expiry}`, 'warning', new Date().toISOString()).run();
+      }
+    }
+  }
+}
+
+export default {
+  fetch: app.fetch,
+  async scheduled(event: any, env: any, ctx: any) {
+    ctx.waitUntil(runChecks(env));
+  },
+};

@@ -26,3 +26,6 @@ ENVIRONMENT = "prod"
 # OIDC_CLIENT_ID = "your-client-id"
 # OIDC_CLIENT_SECRET = "your-client-secret"
 # OIDC_REDIRECT_URI = "https://nist-rmf-portal.axoss.workers.dev/api/auth/oidc/callback"
+
+[triggers]
+crons = ["0 6 * * *"]

@@ -6,6 +6,7 @@ import Systems from './pages/Systems';
 import SystemDetail from './pages/SystemDetail';
 import Audit from './pages/Audit';
 import Security from './pages/Security';
+import Notifications from './pages/Notifications';
 import { getToken, clearToken } from './api';
 
 function Nav() {
@@ -17,6 +18,7 @@ function Nav() {
       {authed && <Link to="/systems">Systems</Link>}
       {authed && <Link to="/audit">Audit</Link>}
       {authed && <Link to="/security">Security</Link>}
+      {authed && <Link to="/notifications">Notifications</Link>}
       <div className="spacer" />
       {authed && <button className="btn secondary" onClick={() => { clearToken(); nav('/login'); }}>Logout</button>}
     </div>
@@ -35,6 +37,7 @@ export default function App() {
           <Route path="/systems/:id" element={getToken() ? <SystemDetail /> : <Navigate to="/login" />} />
           <Route path="/audit" element={getToken() ? <Audit /> : <Navigate to="/login" />} />
           <Route path="/security" element={getToken() ? <Security /> : <Navigate to="/login" />} />
+          <Route path="/notifications" element={getToken() ? <Notifications /> : <Navigate to="/login" />} />
           <Route path="/" element={getToken() ? <Navigate to="/systems" /> : <Navigate to="/login" />} />
         </Routes>
       </div>
