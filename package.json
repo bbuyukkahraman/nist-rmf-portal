@@ -7,8 +7,17 @@
     "dev": "pnpm --filter api dev",
     "build": "pnpm --filter web build && pnpm --filter api build",
     "deploy": "pnpm --filter api deploy",
-    "test": "pnpm -r test"
+    "test": "pnpm -r test",
+    "test:e2e": "playwright test"
   },
-  "workspaces": ["apps/*", "packages/*"],
-  "engines": { "node": ">=20" }
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0"
+  }
 }

@@ -32,6 +32,8 @@ jobs:
       - run: pnpm --filter web build
       - run: pnpm --filter api build
       - run: pnpm --filter api test
+      - run: npx playwright install chromium
+      - run: BASE_URL=https://nist-rmf-portal.axoss.workers.dev npx playwright test
 
   deploy:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
